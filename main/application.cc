@@ -7,6 +7,7 @@
 #include "display.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
+#include "robot_reply.h"
 #include "settings.h"
 #include "system_info.h"
 #include "text_glyph_payload.h"
@@ -21,6 +22,27 @@
 #include <limits>
 
 #define TAG "Application"
+
+static float CalculatePcmLevel(const std::vector<int16_t>& pcm) {
+    if (pcm.empty()) {
+        return 0.0f;
+    }
+
+    uint64_t sum_abs = 0;
+    size_t sampled = 0;
+    constexpr size_t step = 2;
+    for (size_t i = 0; i < pcm.size(); i += step) {
+        sum_abs += static_cast<uint32_t>(std::abs(pcm[i]));
+        sampled++;
+    }
+    if (sampled == 0) {
+        return 0.0f;
+    }
+
+    float avg_abs = static_cast<float>(sum_abs) / static_cast<float>(sampled);
+    float normalized = avg_abs / 12000.0f;
+    return std::max(0.0f, std::min(1.0f, normalized));
+}
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -95,6 +117,13 @@ void Application::Initialize() {
     };
     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
+    };
+    callbacks.on_audio_output = [this](const std::vector<int16_t>& pcm) {
+        // 音频输出任务回调：说话时驱动表情嘴部动画
+        if (GetDeviceState() == kDeviceStateSpeaking) {
+            Board::GetInstance().GetDisplay()->SetExpressionSpeechMotion(true,
+                                                                         CalculatePcmLevel(pcm));
+        }
     };
     audio_service_.SetCallbacks(callbacks);
 
@@ -283,6 +312,7 @@ void Application::Run() {
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+                Board::GetInstance().GetDisplay()->SetExpressionVoiceActive(IsVoiceDetected());
             }
         }
 
@@ -299,6 +329,12 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+
+            // 机器人回复窗口过期（8s 后不再抑制误导性回复）
+            if (robot_window_active_.load() &&
+                esp_timer_get_time() >= robot_window_deadline_us_.load()) {
+                robot_window_active_.store(false);
+            }
 
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -591,8 +627,13 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+        if (!AcceptIncomingTtsPacket()) {
+            return;
+        }
         if (GetDeviceState() == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+        } else if (tts_hold_active_.load()) {
+            HoldTtsPacket(std::move(packet));
         }
     });
 
@@ -608,6 +649,7 @@ void Application::InitializeProtocol() {
 
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        ResetTtsGateState();
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
@@ -661,12 +703,15 @@ void Application::InitializeProtocol() {
                 return;
             }
             if (strcmp(state->valuestring, "start") == 0) {
+                // 从 tts/start 到首个 sentence_start 之间，先扣住音频（避免首字截断）
+                tts_hold_active_.store(true);
                 Schedule([this]() {
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    ResetTtsGateState();
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -677,23 +722,91 @@ void Application::InitializeProtocol() {
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
-                if (cJSON_IsString(text)) {
+                if (!cJSON_IsString(text)) {
+                    // 无文本：失败开放，冲刷扣住的音频，避免卡死
+                    tts_hold_active_.store(false);
+                    Schedule([this]() { FlushHeldTtsPackets(); });
+                } else {
+                    std::string original = text->valuestring;
+                    std::string cleaned = original;
+                    robot_reply::StripMcpLeaksFromTtsText(cleaned);
+                    const bool stripped_md = robot_reply::StripSpokenMarkdownFromTtsText(cleaned);
+
+                    const int64_t now = esp_timer_get_time();
+                    const bool window_active = robot_window_active_.load() &&
+                                               now < robot_window_deadline_us_.load();
+                    const bool misleading =
+                        robot_reply::IsMisleadingLocalCommandReply(cleaned) &&
+                        (window_active || local_robot_command_time_us_.load() > 0);
+                    const bool movement_suppress =
+                        local_movement_reply_suppressing_.load() ||
+                        (local_movement_command_time_us_.load() > 0 &&
+                         now - local_movement_command_time_us_.load() < 8000000);
+                    const bool tool_followup =
+                        !robot_reply::IsToolInvocationText(original) &&
+                        robot_reply::IsUnhelpfulToolFollowupReply(cleaned) &&
+                        last_mcp_tool_leak_time_us_.load() > 0 &&
+                        now - last_mcp_tool_leak_time_us_.load() < 8000000;
+
+                    const bool is_tool_leak = robot_reply::IsToolInvocationText(original) ||
+                                              robot_reply::IsRobotToolInvocationText(original) ||
+                                              cleaned.empty();
+
                     std::vector<TextGlyph> glyphs;
                     uint8_t bpp = 0;
                     if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
-                              glyphs = std::move(glyphs), bpp]() {
-                        display->AddTextGlyphs(glyphs, bpp);
-                        display->SetChatMessage("assistant", message.c_str());
-                    });
+
+                    if (is_tool_leak) {
+                        // 工具调用泄漏行：扣住音频丢弃，但不静音（下一句正常）
+                        tts_hold_active_.store(false);
+                        ClearHeldTtsPackets();
+                        last_mcp_tool_leak_time_us_.store(now);
+                        if (robot_reply::IsRobotToolInvocationText(original)) {
+                            local_robot_command_time_us_.store(now);
+                        }
+                    } else if (misleading || movement_suppress || tool_followup) {
+                        // 误导性/移动/tool 收尾回复：静音当前句并恢复聆听
+                        SuppressCurrentSentence(now + 1200000);
+                        Schedule([this, reason = misleading ? "misleading reply"
+                                                             : (movement_suppress ? "movement reply"
+                                                                                  : "tool followup")]() {
+                            AbortTtsAndResumeListening(reason);
+                        });
+                    } else if (stripped_md) {
+                        // Markdown 回复：静音，仅显示清洗后文本
+                        SuppressCurrentSentence(now + 8000000);
+                        last_speaking_audio_us_.store(now);
+                        Schedule([display, message = cleaned]() {
+                            display->SetChatMessage("assistant", message.c_str());
+                        });
+                    } else {
+                        // 正常句子：放行音频
+                        tts_hold_active_.store(false);
+                        Schedule([this]() { FlushHeldTtsPackets(); });
+                        Schedule([display, message = cleaned,
+                                  glyphs = std::move(glyphs), bpp]() {
+                            display->AddTextGlyphs(glyphs, bpp);
+                            display->SetChatMessage("assistant", message.c_str());
+                        });
+                    }
                 }
             }
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
+                // 新用户轮次：重置回复抑制状态（同步于 JSON 任务，先于后续 tts）
+                discard_aborted_robot_reply_.store(false);
+                robot_window_active_.store(false);
+                robot_window_deadline_us_.store(0);
+                local_movement_reply_suppressing_.store(false);
+                local_movement_command_time_us_.store(0);
+                last_mcp_tool_leak_time_us_.store(0);
+                tts_suppress_audio_.store(false);
+                tts_suppress_until_us_.store(0);
+
                 std::vector<TextGlyph> glyphs;
                 uint8_t bpp = 0;
                 if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
@@ -704,6 +817,7 @@ void Application::InitializeProtocol() {
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
+                    Board::GetInstance().OnUserTranscript(message);
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -1056,15 +1170,21 @@ void Application::HandleStateChangedEvent() {
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+            display->SetExpressionState(false, false);
+            display->SetExpressionSpeechMotion(false, 0.0f);
+            display->SetExpressionVoiceActive(false);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
+            display->SetExpressionState(false, false);
             break;
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
+            display->SetExpressionState(true, false);
+            display->SetExpressionSpeechMotion(false, 0.0f);
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
@@ -1083,6 +1203,7 @@ void Application::HandleStateChangedEvent() {
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
+            display->SetExpressionState(false, true);
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
@@ -1093,10 +1214,12 @@ void Application::HandleStateChangedEvent() {
             break;
         case kDeviceStateNotifying:
             display->SetStatus(Lang::Strings::SPEAKING);
+            display->SetExpressionState(false, false);
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             break;
         case kDeviceStateWifiConfiguring:
+            display->SetExpressionState(false, false);
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(false);
             break;
@@ -1284,6 +1407,96 @@ void Application::AbortSpeaking(AbortReason reason) {
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
+}
+
+void Application::NotifyRobotCommandDispatched(const std::string& command, bool movement_only) {
+    const int64_t now = esp_timer_get_time();
+    robot_window_active_.store(true);
+    robot_window_deadline_us_.store(now + 8000000);
+    local_robot_command_time_us_.store(now);
+    if (movement_only) {
+        local_movement_reply_suppressing_.store(true);
+        local_movement_command_time_us_.store(now);
+    }
+    ESP_LOGI(TAG, "Robot command dispatched: %s", command.c_str());
+}
+
+bool Application::AcceptIncomingTtsPacket() {
+    const int64_t now = esp_timer_get_time();
+    if (discard_aborted_robot_reply_.load()) {
+        return false;
+    }
+    if (tts_suppress_audio_.load()) {
+        const int64_t until = tts_suppress_until_us_.load();
+        if (until <= 0 || now < until) {
+            return false;
+        }
+        tts_suppress_audio_.store(false);
+        tts_suppress_until_us_.store(0);
+    }
+    if (local_movement_reply_suppressing_.load()) {
+        return false;
+    }
+    return true;
+}
+
+void Application::HoldTtsPacket(std::unique_ptr<AudioStreamPacket> packet) {
+    std::lock_guard<std::mutex> lock(tts_hold_mutex_);
+    constexpr size_t kMaxPendingTtsPackets = 12;
+    if (pending_tts_packets_.size() >= kMaxPendingTtsPackets) {
+        pending_tts_packets_.pop_front();
+    }
+    pending_tts_packets_.push_back(std::move(packet));
+}
+
+void Application::FlushHeldTtsPackets() {
+    std::lock_guard<std::mutex> lock(tts_hold_mutex_);
+    while (!pending_tts_packets_.empty()) {
+        auto packet = std::move(pending_tts_packets_.front());
+        pending_tts_packets_.pop_front();
+        audio_service_.PushPacketToDecodeQueue(std::move(packet));
+    }
+}
+
+void Application::ClearHeldTtsPackets() {
+    std::lock_guard<std::mutex> lock(tts_hold_mutex_);
+    pending_tts_packets_.clear();
+}
+
+void Application::SuppressCurrentSentence(int64_t until_us) {
+    tts_suppress_audio_.store(true);
+    tts_suppress_until_us_.store(until_us);
+    ClearHeldTtsPackets();
+}
+
+void Application::AbortTtsAndResumeListening(const char* reason) {
+    ESP_LOGI(TAG, "Robot reply suppressed: %s", reason);
+    tts_hold_active_.store(false);
+    tts_suppress_audio_.store(true);
+    tts_suppress_until_us_.store(0);  // 保持静音直到下一轮 stt 复位
+    discard_aborted_robot_reply_.store(true);
+    ClearHeldTtsPackets();
+    AbortSpeaking(kAbortReasonNone);
+
+    const auto state = GetDeviceState();
+    if (state == kDeviceStateNotifying) {
+        return;
+    }
+    if (listening_mode_ == kListeningModeManualStop) {
+        SetDeviceState(kDeviceStateIdle);
+    } else {
+        SetDeviceState(kDeviceStateListening);
+    }
+}
+
+void Application::ResetTtsGateState() {
+    tts_hold_active_.store(false);
+    tts_suppress_audio_.store(false);
+    tts_suppress_until_us_.store(0);
+    discard_aborted_robot_reply_.store(false);
+    local_movement_reply_suppressing_.store(false);
+    local_movement_command_time_us_.store(0);
+    ClearHeldTtsPackets();
 }
 
 void Application::SetListeningMode(ListeningMode mode) {

@@ -1,0 +1,48 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include <driver/gpio.h>
+
+// 立创 ESP32-C3 1.69" 机器人板（Petoi Bittle 定制版，来自 xiaozhi0930）
+// 注意：与 lckfb/szpi-esp32c3（320x240）是不同硬件版本，引脚与屏幕均不同。
+
+#define AUDIO_INPUT_SAMPLE_RATE  24000
+#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+
+// 为了优化布线，2025-07-31 修改了 I2S 引脚（避免 GPIO11 状态异常）
+#define AUDIO_I2S_GPIO_MCLK GPIO_NUM_13
+#define AUDIO_I2S_GPIO_WS   GPIO_NUM_8
+#define AUDIO_I2S_GPIO_BCLK GPIO_NUM_12
+#define AUDIO_I2S_GPIO_DIN  GPIO_NUM_10
+#define AUDIO_I2S_GPIO_DOUT GPIO_NUM_7
+
+#define AUDIO_CODEC_USE_PCA9557
+#define AUDIO_CODEC_PA_PIN       GPIO_NUM_NC
+#define AUDIO_CODEC_I2C_SDA_PIN  GPIO_NUM_0
+#define AUDIO_CODEC_I2C_SCL_PIN  GPIO_NUM_1
+#define AUDIO_CODEC_ES8311_ADDR  ES8311_CODEC_DEFAULT_ADDR
+#define AUDIO_CODEC_ES7210_ADDR  0x82
+
+#define BOOT_BUTTON_GPIO        GPIO_NUM_9
+#define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_NC
+#define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
+
+// 7月28日版本引脚（屏幕排线画反了）
+#define DISPLAY_SPI_SCK_PIN     GPIO_NUM_3
+#define DISPLAY_SPI_MOSI_PIN    GPIO_NUM_4
+#define DISPLAY_DC_PIN          GPIO_NUM_6
+#define DISPLAY_SPI_CS_PIN      GPIO_NUM_5
+
+// 1.69 寸屏幕，240x280，竖屏（0 度），物理 Y 方向偏移 20
+#define DISPLAY_WIDTH   240
+#define DISPLAY_HEIGHT  280
+#define DISPLAY_MIRROR_X false
+#define DISPLAY_MIRROR_Y false
+#define DISPLAY_SWAP_XY false
+#define DISPLAY_OFFSET_X  0
+#define DISPLAY_OFFSET_Y  20
+
+#define DISPLAY_BACKLIGHT_PIN GPIO_NUM_2
+#define DISPLAY_BACKLIGHT_OUTPUT_INVERT true
+
+#endif // _BOARD_CONFIG_H_

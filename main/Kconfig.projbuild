@@ -316,6 +316,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_LICHUANG_DEV_C3
         bool "LCKFB SZPI ESP32-C3 (立创·实战派)"
         depends on IDF_TARGET_ESP32C3
+    config BOARD_TYPE_LICHUANG_C3_ROBOT
+        bool "LCKFB ESP32-C3 1.69\" Robot Dog (立创·机器人 1.69\")"
+        depends on IDF_TARGET_ESP32C3
     config BOARD_TYPE_LICHUANG_DEV_S3
         bool "LCKFB SZPI ESP32-S3 (立创·实战派)"
         depends on IDF_TARGET_ESP32S3

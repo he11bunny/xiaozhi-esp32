@@ -72,6 +72,22 @@ clang-format --dry-run -Werror <files>
 
 The build script changes local `sdkconfig` and build state. Do not assume the build directory still represents a previous target.
 
+## Local Build Preferences
+
+This worktree targets the Petoi Bittle board `lckfb/lichuang-c3-robot`
+(ESP32-C3, 16 MB flash, English UI, USB-Serial/JTAG console).
+
+- Unless the user says otherwise, build with wake word **"Hi, Jason."**
+  (`--wake-word wn9s_hijason`, ESP-SR WakeNet9s) and language `en-US`:
+  ```sh
+  python3 scripts/build.py lckfb/lichuang-c3-robot --name lichuang-c3-robot \
+    --language en-US --wake-word wn9s_hijason
+  ```
+- Flash the C3 through its native USB port (currently `/dev/cu.usbmodem2101`);
+  confirm with `esptool chip_id` that the port is an ESP32-C3 before flashing.
+  Other serial ports may belong to unrelated boards.
+- Confirm the boot log line `EspWakeWord: Wake word(wn9s_hijason)` after flashing.
+
 ## Validation
 
 - Board-only change: build affected variants and smoke-test changed hardware.

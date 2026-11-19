@@ -63,6 +63,19 @@ public:
     virtual bool IsMonochrome() const { return false; }
     virtual bool SupportsGuiOperations() const { return false; }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }
+    // 表情 UI 钩子（默认空实现，供表情类显示覆写）
+    virtual void SetExpressionState(bool recording, bool speaking) {
+        (void)recording;
+        (void)speaking;
+    }
+    virtual void SetExpressionVoiceActive(bool active) { (void)active; }
+    virtual void SetExpressionSpeechMotion(bool active, float level) {
+        (void)active;
+        (void)level;
+    }
+    virtual void SetExpressionLook(const std::string& direction) { (void)direction; }
+    virtual void TriggerExpressionBlink(int times) { (void)times; }
+    virtual void SetExpressionMouthWidth(int width) { (void)width; }
     virtual bool InsertAnimDialog(const char* name, uint32_t duration_ms) {
         (void)name;
         (void)duration_ms;

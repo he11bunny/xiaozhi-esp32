@@ -85,6 +85,8 @@ public:
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
     virtual std::string GetSystemInfoJson();
+    // 收到用户语音转写文本时回调（默认空实现）。板卡可覆写以做本地动作解析等。
+    virtual void OnUserTranscript(const std::string& text) { (void)text; }
     static const char* ResetReasonName(esp_reset_reason_t reason);
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;

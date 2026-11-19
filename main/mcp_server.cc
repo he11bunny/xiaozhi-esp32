@@ -651,7 +651,7 @@ void McpServer::ReplyError(const McpRequestContext& context, const std::string& 
 
 void McpServer::GetToolsList(const McpRequestContext& context, const std::string& cursor,
                              bool list_user_only_tools, const ResponseSender& response_sender) {
-    constexpr size_t kMaxPayloadSize = 8000;
+    constexpr size_t kMaxPayloadSize = 2000;
     const size_t envelope_size = ResultPrefix(context).size() + 2;
     const std::string suffix = context.modern ? R"(],"ttlMs":60000,"cacheScope":"private")" : "]";
     auto it = tools_.begin();

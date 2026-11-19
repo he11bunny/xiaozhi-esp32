@@ -13,6 +13,7 @@
 #include <functional>
 #include <cstdint>
 #include <vector>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
@@ -83,6 +84,13 @@ public:
      */
     void Schedule(std::function<void()>&& callback);
     void NotifyProtocolPending() { xEventGroupSetBits(event_group_, MAIN_EVENT_PROTOCOL_PENDING); }
+
+    /**
+     * 记录"一条机器人指令已派发"，开启 8s 回复抑制窗口。
+     * movement_only=true 时额外静音整段回复（本地移动指令）。
+     * 由机器人控制器（MCP 工具 / 本地指令解析）调用。
+     */
+    void NotifyRobotCommandDispatched(const std::string& command, bool movement_only = false);
 
     /**
      * Alert with status, message, emotion and optional sound
@@ -160,6 +168,21 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
+    // --- 机器人回复抑制状态（移植自 xiaozhi0930） ---
+    std::atomic<bool> tts_hold_active_{false};
+    std::atomic<bool> tts_suppress_audio_{false};
+    std::atomic<int64_t> tts_suppress_until_us_{0};
+    std::atomic<bool> discard_aborted_robot_reply_{false};
+    std::atomic<bool> robot_window_active_{false};
+    std::atomic<int64_t> robot_window_deadline_us_{0};
+    std::atomic<int64_t> local_robot_command_time_us_{0};
+    std::atomic<int64_t> local_movement_command_time_us_{0};
+    std::atomic<bool> local_movement_reply_suppressing_{false};
+    std::atomic<int64_t> last_mcp_tool_leak_time_us_{0};
+    std::atomic<int64_t> last_speaking_audio_us_{0};
+    std::mutex tts_hold_mutex_;
+    std::deque<std::unique_ptr<AudioStreamPacket>> pending_tts_packets_;
+
 
     // Event handlers
     void HandleStateChangedEvent();
@@ -194,6 +217,15 @@ private:
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
+
+    // Robot reply suppression helpers
+    bool AcceptIncomingTtsPacket();
+    void HoldTtsPacket(std::unique_ptr<AudioStreamPacket> packet);
+    void FlushHeldTtsPackets();
+    void ClearHeldTtsPackets();
+    void SuppressCurrentSentence(int64_t until_us);
+    void AbortTtsAndResumeListening(const char* reason);
+    void ResetTtsGateState();
 };
 
 
